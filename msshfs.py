@@ -237,6 +237,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="print diagnostic details (resolved paths, commands) to stderr",
+    )
+
+    parser.add_argument(
         "--open",
         action="store_true",
         help="open the local path with xdg-open after mounting",
@@ -328,6 +335,11 @@ def require_host(host: str | None) -> None:
         raise MsshfsError("missing SSH host")
 
 
+def vlog(args: argparse.Namespace, msg: str) -> None:
+    if getattr(args, "verbose", False):
+        print(f"{APP}: {msg}", file=sys.stderr, flush=True)
+
+
 def should_print_mount_path(args: argparse.Namespace) -> bool:
     return bool(args.print or not sys.stdout.isatty())
 
@@ -335,7 +347,9 @@ def should_print_mount_path(args: argparse.Namespace) -> bool:
 def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
     assert host is not None
 
-    target = make_target(host, remote_path, Path(args.base).expanduser())
+    target = make_target(host, remote_path, Path(args.base).expanduser(), verbose=args.verbose)
+    vlog(args, f"resolved {host}:{remote_path} -> {target.host}:{target.remote_path}")
+    vlog(args, f"local mountpoint: {target.local_path}")
     print_path = should_print_mount_path(args)
 
     if is_mountpoint(target.local_path):
@@ -350,6 +364,13 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
     ensure_mountpoint_dir(target.local_path, allow_non_empty=args.allow_non_empty)
 
     sshfs_options = default_sshfs_options() + list(args.sshfs_option or [])
+
+    if args.verbose:
+        # Make sshfs's underlying ssh verbose. A successful mount still
+        # daemonizes and returns; a stalled one never backgrounds, so its ssh
+        # debug streams live and shows where the connection is stuck.
+        sshfs_options.append("LogLevel=DEBUG")
+
     cmd = [
         "sshfs",
         f"{target.host}:{target.remote_path.as_posix()}",
@@ -363,6 +384,7 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
         print(format_cmd(cmd))
         return 0
 
+    vlog(args, f"running: {format_cmd(cmd)}")
     subprocess.run(cmd, check=True)
 
     if args.open:
@@ -384,13 +406,15 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
 def cmd_umount(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
     assert host is not None
 
-    target = make_target(host, remote_path, Path(args.base).expanduser())
+    target = make_target(host, remote_path, Path(args.base).expanduser(), verbose=args.verbose)
+    vlog(args, f"resolved {host}:{remote_path} -> {target.host}:{target.remote_path}")
+    vlog(args, f"local mountpoint: {target.local_path}")
 
     if not is_mountpoint(target.local_path):
         print(f"Not mounted: {target.local_path}")
         return 0
 
-    unmount_path(target.local_path, lazy=args.lazy, dry_run=args.dry_run)
+    unmount_path(args, target.local_path, lazy=args.lazy, dry_run=args.dry_run)
     return 0
 
 
@@ -414,7 +438,7 @@ def cmd_umount_all(args: argparse.Namespace) -> int:
 
     for target in targets:
         try:
-            unmount_path(Path(target), lazy=args.lazy, dry_run=args.dry_run)
+            unmount_path(args, Path(target), lazy=args.lazy, dry_run=args.dry_run)
         except subprocess.CalledProcessError as exc:
             failures += 1
             print(f"Error: failed to unmount {target}: {exc}", file=sys.stderr)
@@ -422,7 +446,9 @@ def cmd_umount_all(args: argparse.Namespace) -> int:
     return 1 if failures else 0
 
 
-def unmount_path(local_path: Path, *, lazy: bool, dry_run: bool) -> None:
+def unmount_path(
+    args: argparse.Namespace, local_path: Path, *, lazy: bool, dry_run: bool
+) -> None:
     fusermount = find_executable(["fusermount3", "fusermount"])
 
     if fusermount:
@@ -434,6 +460,7 @@ def unmount_path(local_path: Path, *, lazy: bool, dry_run: bool) -> None:
         print(format_cmd(cmd))
         return
 
+    vlog(args, f"running: {format_cmd(cmd)}")
     subprocess.run(cmd, check=True)
     print(f"Unmounted: {local_path}")
 
@@ -441,7 +468,7 @@ def unmount_path(local_path: Path, *, lazy: bool, dry_run: bool) -> None:
 def cmd_path(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
     assert host is not None
 
-    target = make_target(host, remote_path, Path(args.base).expanduser())
+    target = make_target(host, remote_path, Path(args.base).expanduser(), verbose=args.verbose)
     print(target.local_path)
     return 0
 
@@ -449,7 +476,7 @@ def cmd_path(args: argparse.Namespace, host: str | None, remote_path: str) -> in
 def cmd_status(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
     assert host is not None
 
-    target = make_target(host, remote_path, Path(args.base).expanduser())
+    target = make_target(host, remote_path, Path(args.base).expanduser(), verbose=args.verbose)
     mounted = is_mountpoint(target.local_path)
     state = "mounted" if mounted else "not mounted"
     print(f"{state}: {target.local_path}")
@@ -470,8 +497,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
-def make_target(host: str, input_path: str, base: Path) -> Target:
-    remote_path = resolve_remote_path(host, input_path)
+def make_target(
+    host: str, input_path: str, base: Path, *, verbose: bool = False
+) -> Target:
+    remote_path = resolve_remote_path(host, input_path, verbose=verbose)
     local_path = local_path_for(base, host, remote_path)
     return Target(
         host=host,
@@ -481,30 +510,39 @@ def make_target(host: str, input_path: str, base: Path) -> Target:
     )
 
 
-def resolve_remote_path(host: str, input_path: str) -> PurePosixPath:
+def resolve_remote_path(
+    host: str, input_path: str, *, verbose: bool = False
+) -> PurePosixPath:
     cmd = [
         "ssh",
         "-o",
         "BatchMode=yes",
         "-o",
         f"ConnectTimeout={SSH_TIMEOUT_SECONDS}",
-        host,
-        "bash",
-        "-s",
-        "--",
-        input_path,
     ]
+
+    if verbose:
+        cmd.append("-v")
+
+    cmd += [host, "bash", "-s", "--", input_path]
+
+    if verbose:
+        # Print the command and let ssh's own -v output stream straight to the
+        # terminal (stderr is not captured) so a stalled connection is visible
+        # live instead of being swallowed until the call returns.
+        print(f"{APP}: running: {format_cmd(cmd)}", file=sys.stderr, flush=True)
 
     proc = subprocess.run(
         cmd,
         input=REMOTE_RESOLVE_SCRIPT,
         text=True,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=None if verbose else subprocess.PIPE,
         check=False,
     )
 
     if proc.returncode != 0:
-        stderr = proc.stderr.strip()
+        stderr = (proc.stderr or "").strip()
         detail = f": {stderr}" if stderr else ""
         raise MsshfsError(f"could not resolve remote path on {host!r}{detail}")
 

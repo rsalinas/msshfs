@@ -264,6 +264,27 @@ Això imprimeix el comandament `sshfs` que s’executaria.
 
 ---
 
+## Veure detalls de diagnòstic
+
+Usa `--verbose` (o `-v`) per imprimir per `stderr` la ruta remota resolta, el
+punt local de muntatge i els comandaments que s’executen:
+
+```bash
+msshfs -v myserver Project
+msshfs -v umount myserver Project
+```
+
+A més, `-v` propaga la verbositat a l’`ssh` subjacent: la resolució de la ruta
+remota s’executa amb `ssh -v` (i la seva sortida de depuració es mostra en
+directe, sense capturar) i el muntatge afegeix `-o LogLevel=DEBUG` a `sshfs`.
+Això és útil per veure on es queda penjada una connexió: un muntatge correcte
+passa a segon pla com sempre, però un de penjat es queda en primer pla mostrant
+la depuració d’`ssh`.
+
+A diferència de `--dry-run`, `--verbose` sí que executa les accions.
+
+---
+
 ## Imprimir només la ruta local
 
 Amb la subordre `path`:
