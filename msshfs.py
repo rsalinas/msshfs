@@ -4,9 +4,12 @@
 msshfs — Mount SSHFS paths under ~/mnt/sshfs/<host>/<absolute-remote-path>
 
 Examples:
+  msshfs                            # list active sshfs mounts
   msshfs raspi4 repos/project
+  msshfs -c raspi4 repos/project    # also copy local path to the clipboard
   msshfs mount raspi4 ~/repos/project
   msshfs umount raspi4 ~/repos/project
+  msshfs umount --all               # unmount everything (no SSH, clears dead mounts)
   msshfs path raspi4 /var/www
   msshfs status raspi4 /var/www
   msshfs list
@@ -178,6 +181,8 @@ def run(argv: Sequence[str] | None = None) -> int:
             return cmd_mount(args, host, remote_path)
 
         if command == "umount":
+            if args.all:
+                return cmd_umount_all(args)
             require_host(host)
             return cmd_umount(args, host, remote_path)
 
@@ -244,6 +249,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     parser.add_argument(
+        "--clipboard",
+        "-c",
+        action="store_true",
+        help="copy the local mount path to the clipboard via xsel -b",
+    )
+
+    parser.add_argument(
         "--allow-non-empty",
         action="store_true",
         help="allow mounting over a non-empty directory",
@@ -256,10 +268,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="lazy unmount via fusermount3 -uz",
     )
 
+    parser.add_argument(
+        "--all",
+        "-a",
+        action="store_true",
+        help="umount: unmount every msshfs mount (no SSH needed, works on dead mounts)",
+    )
+
     first = parser.add_argument(
         "first",
         nargs="?",
-        default="help",
+        default="list",
         help="command or SSH host. Commands: mount, umount, list, status, path, help",
     )
     first.completer = complete_first_for_argcomplete
@@ -320,6 +339,8 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
     print_path = should_print_mount_path(args)
 
     if is_mountpoint(target.local_path):
+        if args.clipboard:
+            copy_to_clipboard(str(target.local_path))
         if print_path:
             print(target.local_path)
         else:
@@ -350,6 +371,8 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+    if args.clipboard:
+        copy_to_clipboard(str(target.local_path))
     if print_path:
         print(target.local_path)
     else:
@@ -367,23 +390,52 @@ def cmd_umount(args: argparse.Namespace, host: str | None, remote_path: str) -> 
         print(f"Not mounted: {target.local_path}")
         return 0
 
+    unmount_path(target.local_path, lazy=args.lazy, dry_run=args.dry_run)
+    return 0
+
+
+def cmd_umount_all(args: argparse.Namespace) -> int:
+    base = Path(args.base).expanduser()
+    mounts = list_msshfs_mounts(base)
+
+    if not mounts:
+        print(f"No active msshfs mounts below {base}")
+        return 0
+
+    # Unmount deepest paths first so nested mounts come down before their
+    # parents. No SSH is involved, so this also clears dead/stale mounts.
+    targets = sorted(
+        (line.split(maxsplit=1)[0] for line in mounts),
+        key=len,
+        reverse=True,
+    )
+
+    failures = 0
+
+    for target in targets:
+        try:
+            unmount_path(Path(target), lazy=args.lazy, dry_run=args.dry_run)
+        except subprocess.CalledProcessError as exc:
+            failures += 1
+            print(f"Error: failed to unmount {target}: {exc}", file=sys.stderr)
+
+    return 1 if failures else 0
+
+
+def unmount_path(local_path: Path, *, lazy: bool, dry_run: bool) -> None:
     fusermount = find_executable(["fusermount3", "fusermount"])
 
     if fusermount:
-        cmd = [fusermount, "-u"]
-        if args.lazy:
-            cmd[-1] = "-uz"
-        cmd.append(str(target.local_path))
+        cmd = [fusermount, "-uz" if lazy else "-u", str(local_path)]
     else:
-        cmd = ["umount", str(target.local_path)]
+        cmd = ["umount", str(local_path)]
 
-    if args.dry_run:
+    if dry_run:
         print(format_cmd(cmd))
-        return 0
+        return
 
     subprocess.run(cmd, check=True)
-    print(f"Unmounted: {target.local_path}")
-    return 0
+    print(f"Unmounted: {local_path}")
 
 
 def cmd_path(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
@@ -482,18 +534,60 @@ def safe_host_segment(host: str) -> str:
 def ensure_mountpoint_dir(path: Path, *, allow_non_empty: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
-    if allow_non_empty:
+    if allow_non_empty or is_dir_empty(path):
         return
 
+    # The directory is non-empty. This commonly happens when a deeper path was
+    # mounted earlier (e.g. .../a/b/c) and we now mount a prefix of it
+    # (.../a/b): the leftover empty skeleton would otherwise hide the parent.
+    # Prune empty leftover subdirectories, staying on this filesystem (-xdev)
+    # so we never touch directories that are themselves live sshfs mounts.
+    prune_empty_dirs(path)
+
+    if is_dir_empty(path):
+        return
+
+    raise MsshfsError(
+        f"local mountpoint exists and is not empty: {path} "
+        "(contains files or live mounts; use --allow-non-empty to override)"
+    )
+
+
+def is_dir_empty(path: Path) -> bool:
     try:
         next(path.iterdir())
     except StopIteration:
-        return
+        return True
     except FileNotFoundError:
-        path.mkdir(parents=True, exist_ok=True)
+        return True
+
+    return False
+
+
+def prune_empty_dirs(path: Path) -> None:
+    find = find_executable(["find"])
+
+    if not find:
         return
 
-    raise MsshfsError(f"local mountpoint exists and is not empty: {path}")
+    # -xdev keeps the traversal on a single filesystem, so a nested live sshfs
+    # mount (a different device) is never descended into nor deleted. -mindepth
+    # 1 preserves `path` itself. Only empty directories are removed.
+    subprocess.run(
+        [
+            find,
+            str(path),
+            "-xdev",
+            "-mindepth", "1",
+            "-depth",
+            "-type", "d",
+            "-empty",
+            "-delete",
+        ],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def default_sshfs_options() -> list[str]:
@@ -501,6 +595,9 @@ def default_sshfs_options() -> list[str]:
         "reconnect",
         "ServerAliveInterval=15",
         "ServerAliveCountMax=3",
+        # Restrict the mounted tree to the owner: hide group/other bits so
+        # nothing under the mountpoint is accessible by group or others.
+        "umask=077",
     ]
 
 
@@ -541,6 +638,24 @@ def list_msshfs_mounts(base: Path) -> list[str]:
             out.append(line)
 
     return out
+
+
+def copy_to_clipboard(text: str) -> None:
+    xsel = find_executable(["xsel"])
+
+    if not xsel:
+        print("Warning: xsel not found; cannot copy to clipboard.", file=sys.stderr)
+        return
+
+    try:
+        subprocess.run(
+            [xsel, "-b"],
+            input=text,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        print(f"Warning: could not copy to clipboard: {exc}", file=sys.stderr)
 
 
 def find_executable(names: Iterable[str]) -> str | None:
