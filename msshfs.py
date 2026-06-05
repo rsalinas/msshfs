@@ -309,13 +309,18 @@ def require_host(host: str | None) -> None:
         raise MsshfsError("missing SSH host")
 
 
+def should_print_mount_path(args: argparse.Namespace) -> bool:
+    return bool(args.print or not sys.stdout.isatty())
+
+
 def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
     assert host is not None
 
     target = make_target(host, remote_path, Path(args.base).expanduser())
+    print_path = should_print_mount_path(args)
 
     if is_mountpoint(target.local_path):
-        if args.print:
+        if print_path:
             print(target.local_path)
         else:
             print(f"Already mounted: {target.local_path}")
@@ -345,7 +350,7 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-    elif args.print:
+    if print_path:
         print(target.local_path)
     else:
         print(f"Mounted: {target.host}:{target.remote_path} -> {target.local_path}")
