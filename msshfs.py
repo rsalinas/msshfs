@@ -35,6 +35,7 @@ Recommended SSH config for fast remote completion:
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import re
 import shlex
@@ -352,7 +353,13 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
     vlog(args, f"local mountpoint: {target.local_path}")
     print_path = should_print_mount_path(args)
 
-    if is_mountpoint(target.local_path):
+    if is_mount_dead(target.local_path):
+        # The sshfs process/connection died: the path still exists as a mount
+        # but every access fails with ENOTCONN, and `mountpoint -q` itself
+        # reports false. Lazily unmount the corpse and fall through to remount.
+        vlog(args, f"dead mount (ENOTCONN); remounting {target.local_path}")
+        unmount_path(args, target.local_path, lazy=True, dry_run=args.dry_run)
+    elif is_mountpoint(target.local_path):
         if args.clipboard:
             copy_to_clipboard(str(target.local_path))
         if print_path:
@@ -637,6 +644,17 @@ def default_sshfs_options() -> list[str]:
         # nothing under the mountpoint is accessible by group or others.
         "umask=077",
     ]
+
+
+def is_mount_dead(path: Path) -> bool:
+    """A FUSE mount whose backing sshfs process/connection is gone: still a
+    mountpoint, but any access fails with ENOTCONN ("Transport endpoint is not
+    connected"). The kernel answers this locally, so it never blocks."""
+    try:
+        os.stat(path)
+    except OSError as exc:
+        return exc.errno == errno.ENOTCONN
+    return False
 
 
 def is_mountpoint(path: Path) -> bool:
