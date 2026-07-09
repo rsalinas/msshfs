@@ -520,9 +520,24 @@ def make_target(
     )
 
 
+WINDOWS_DRIVE_PATH_RE = re.compile(r"^/?([A-Za-z]):[\\/](.*)$")
+
+
 def resolve_remote_path(
     host: str, input_path: str, *, verbose: bool = False
 ) -> PurePosixPath:
+    # Win32-OpenSSH hosts have no POSIX shell to run REMOTE_RESOLVE_SCRIPT on,
+    # but their sftp-server exposes drives as /<letter>:/..., which is what
+    # sshfs itself expects. Skip the SSH round-trip entirely for these.
+    windows_match = WINDOWS_DRIVE_PATH_RE.match(input_path)
+    if windows_match:
+        drive, rest = windows_match.groups()
+        rest = rest.replace("\\", "/").strip("/")
+        path = f"/{drive.upper()}:/{rest}" if rest else f"/{drive.upper()}:"
+        if verbose:
+            print(f"{APP}: Windows drive path, skipping SSH resolve: {path}", file=sys.stderr, flush=True)
+        return PurePosixPath(path)
+
     cmd = [
         "ssh",
         "-o",
