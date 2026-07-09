@@ -365,7 +365,7 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
         if print_path:
             print(target.local_path)
         else:
-            print(f"Already mounted: {target.local_path}")
+            print(f"Already mounted: {target.local_path}", file=sys.stderr)
         return 0
 
     ensure_mountpoint_dir(target.local_path, allow_non_empty=args.allow_non_empty)
@@ -405,7 +405,10 @@ def cmd_mount(args: argparse.Namespace, host: str | None, remote_path: str) -> i
     if print_path:
         print(target.local_path)
     else:
-        print(f"Mounted: {target.host}:{target.remote_path} -> {target.local_path}")
+        print(
+            f"Mounted: {target.host}:{target.remote_path} -> {target.local_path}",
+            file=sys.stderr,
+        )
 
     return 0
 
@@ -469,7 +472,7 @@ def unmount_path(
 
     vlog(args, f"running: {format_cmd(cmd)}")
     subprocess.run(cmd, check=True)
-    print(f"Unmounted: {local_path}")
+    print(f"Unmounted: {local_path}", file=sys.stderr)
 
 
 def cmd_path(args: argparse.Namespace, host: str | None, remote_path: str) -> int:
